@@ -1,0 +1,43 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "서버 (server2.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/server2.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": { "PYTHONIOENCODING": "utf-8" }
+    },
+    {
+      "name": "클라이언트 1 (client1.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/client1.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": { "PYTHONIOENCODING": "utf-8" }
+    },
+    {
+      "name": "클라이언트 2 (client1.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/client1.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": { "PYTHONIOENCODING": "utf-8" }
+    }
+  ],
+  "compounds": [
+    {
+      "name": "서버 + 클라이언트 2개",
+      "configurations": [
+        "서버 (server2.py)",
+        "클라이언트 1 (client1.py)",
+        "클라이언트 2 (client1.py)"
+      ],
+      "stopAll": true
+    }
+  ]
+}

@@ -2,9 +2,10 @@ import socket
 import threading
 import random
 import time
+import os
 
 HOST = "0.0.0.0"
-PORT = 5000
+PORT = int(os.environ.get("TYPING_PORT", 5000))  # 기본 5000, 테스트용으로 환경변수로 바꿀 수 있음
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind((HOST, PORT))
@@ -24,6 +25,8 @@ game_active = False       # 게임이 진행 중인지 확인
 game_questions = []       # 이번 판에 뽑힌 10개의 문제
 player_progress = {}      # 각 플레이어가 몇 번째 문제를 풀고 있는지 기록 (예: {client: 3})
 start_time = 0
+ready_players = set()     # '다시 하기(준비)'를 누른 플레이어
+countdown_active = False  # 3·2·1 카운트다운 중인지
 
 # (아까 받으신 100개의 질문 리스트를 여기에 넣으세요)
 questions = [
@@ -131,6 +134,8 @@ questions = [
 
 def send_packet(client, tag, content=""):
     """TCP 메시지 경계를 보장하기 위해 모든 패킷을 줄바꿈으로 끝낸다."""
+    # 내용 속 줄바꿈은 패킷 경계(\n)와 헷갈리지 않게 '\\n' 기호로 바꿔 보낸다. (클라이언트가 다시 줄바꿈으로 복원)
+    content = str(content).replace("\n", "\\n")
     try:
         client.sendall(f"{tag}|{content}\n".encode("utf-8"))
         return True
@@ -148,7 +153,6 @@ def broadcast(tag, content="", exclude=None):
 
 def disconnect_client(client, reason="연결 종료"):
     """정상 종료·강제 종료·하트비트 시간 초과를 한 곳에서 처리한다."""
-    global game_active
     with state_lock:
         if client not in clients:
             return
@@ -156,12 +160,10 @@ def disconnect_client(client, reason="연결 종료"):
         clients.remove(client)
         client_addresses.pop(client, None)
         last_pong.pop(client, None)
-        was_playing = client in player_progress
-        player_progress.pop(client, None)
+        ready_players.discard(client)
+        was_playing = game_active and client in player_progress
         if was_playing:
-            game_active = False
-            player_progress.clear()
-            game_questions.clear()
+            reset_game_locked()
     try:
         client.shutdown(socket.SHUT_RDWR)
     except OSError:
@@ -170,7 +172,82 @@ def disconnect_client(client, reason="연결 종료"):
     print(f"[퇴장] {address} - {reason}")
     broadcast("system", f"⚠️ 상대방의 연결이 끊어졌습니다. ({address[1]})")
     if was_playing:
-        broadcast("system", "게임이 중단되었습니다. 채팅창에 '시작'을 입력해 새 게임을 시작하세요.")
+        broadcast("system", "게임이 중단되었습니다. '🔄 다시 하기' 버튼(또는 '시작' 입력)으로 준비하세요.")
+        broadcast("state", "lobby")
+    # 나간 사람만 준비를 안 했던 경우, 남은 사람끼리 바로 시작할 수 있다.
+    with state_lock:
+        check_all_ready_locked()
+
+
+# ========================================
+# 재시작(준비 → 카운트다운 → 시작) 로직
+# ========================================
+def reset_game_locked():
+    """진행 중인 판을 정리한다. state_lock을 잡은 상태에서 호출."""
+    global game_active
+    game_active = False
+    player_progress.clear()
+    game_questions.clear()
+    ready_players.clear()
+
+
+def begin_game_locked():
+    """새 판을 시작한다. state_lock을 잡은 상태에서 호출."""
+    global game_active, game_questions, start_time
+    game_active = True
+    game_questions = random.sample(questions, 10)
+    start_time = time.time()
+    player_progress.clear()
+    targets = list(clients)
+    for target in targets:
+        player_progress[target] = 0
+    for target in targets:
+        send_packet(target, "state", "playing")
+        send_packet(target, "system", "\n🚨 게임 시작! 10개의 문장을 먼저 클리어하세요! 🚨")
+        send_packet(target, "system", "▶ [STAGE 1/10]")
+        send_packet(target, "game", game_questions[0])
+
+
+def countdown_and_start():
+    global countdown_active
+    broadcast("state", "countdown")
+    for n in (3, 2, 1):
+        broadcast("system", f"⏳ {n}...")
+        time.sleep(1)
+    with state_lock:
+        countdown_active = False
+        if clients and not game_active:
+            begin_game_locked()
+
+
+def check_all_ready_locked():
+    """접속한 모두가 준비했으면 카운트다운을 시작한다. state_lock을 잡은 상태에서 호출."""
+    global countdown_active
+    if game_active or countdown_active or not clients:
+        return
+    if all(c in ready_players for c in clients):
+        countdown_active = True
+        ready_players.clear()
+        threading.Thread(target=countdown_and_start, daemon=True).start()
+
+
+def mark_ready(client, address):
+    with state_lock:
+        if game_active:
+            send_packet(client, "system", "이미 게임이 진행 중입니다. 판을 리셋하려면 '/재시작'을 입력하세요.")
+            return
+        if countdown_active:
+            send_packet(client, "system", "곧 게임이 시작됩니다!")
+            return
+        if client in ready_players:
+            send_packet(client, "system", "이미 준비 완료 상태입니다. 다른 플레이어를 기다리는 중...")
+            return
+        ready_players.add(client)
+        ready_count = sum(1 for c in clients if c in ready_players)
+        total = len(clients)
+    broadcast("system", f"✅ [유저 {address[1]}] 준비 완료 ({ready_count}/{total})")
+    with state_lock:
+        check_all_ready_locked()
 
 
 def heartbeat_monitor():
@@ -188,7 +265,6 @@ def heartbeat_monitor():
 
 
 def process_message(client, address, tag, content):
-    global game_active, game_questions, player_progress, start_time
     if tag == "pong":
         with state_lock:
             last_pong[client] = time.time()
@@ -196,21 +272,23 @@ def process_message(client, address, tag, content):
     if tag == "ping":
         send_packet(client, "pong", content)
         return
+    if tag == "ready":
+        mark_ready(client, address)
+        return
     if tag != "chat":
         return
 
     with state_lock:
-        if content == "시작" and not game_active:
-            game_active = True
-            game_questions = random.sample(questions, 10)
-            start_time = time.time()
-            targets = list(clients)
-            for target in targets:
-                player_progress[target] = 0
-            for target in targets:
-                send_packet(target, "system", "\n🚨 게임 시작! 10개의 문장을 먼저 클리어하세요! 🚨")
-                send_packet(target, "system", "▶ [STAGE 1/10]")
-                send_packet(target, "game", game_questions[0])
+        if content == "시작":
+            mark_ready(client, address)
+            return
+        if content == "/재시작":
+            if game_active:
+                reset_game_locked()
+                broadcast("system", f"🔄 [유저 {address[1]}]님이 게임을 리셋했습니다. '🔄 다시 하기' 버튼(또는 '시작')으로 준비하세요.")
+                broadcast("state", "lobby")
+            else:
+                mark_ready(client, address)
             return
         if not (game_active and client in player_progress):
             broadcast("chat", f"[유저 {address[1]}]: {content}")
@@ -228,9 +306,9 @@ def process_message(client, address, tag, content):
             speed = int((sum(len(q) for q in game_questions) / record) * 60)
             for target in targets:
                 send_packet(target, "notice", f"🏆 [유저 {address[1]}]님 10단계 최종 우승! 🏆\n 👉 최종 기록: {record:.2f}초 (평균 타자 속도: 약 {speed}타)")
-            game_active = False
-            player_progress.clear()
-            game_questions.clear()
+                send_packet(target, "system", "한 판 더? '🔄 다시 하기'를 누르면 모두 준비됐을 때 3초 뒤 시작합니다.")
+                send_packet(target, "state", "ended")
+            reset_game_locked()
             return
         # 3·7단계는 선착순 보너스가 아니라, 각 플레이어가 통과할 때마다 발동한다.
         # 따라서 두 번째 플레이어도 해당 단계를 통과하면 상대에게 안개를 보낼 수 있다.
@@ -254,17 +332,23 @@ def handle_client(client, address):
         clients.append(client)
         client_addresses[client] = address
         last_pong[client] = time.time()
-    buffer = ""
+        playing_now = game_active
+    send_packet(client, "state", "playing" if playing_now else "lobby")
+    if playing_now:
+        send_packet(client, "system", "지금은 게임이 진행 중이에요. 다음 판부터 참여할 수 있어요.")
+    # 바이트 단위로 모아야 한글(3바이트)이 recv 경계에서 잘려도 깨지지 않는다.
+    buffer = b""
     try:
         while True:
             data = client.recv(4096)
             if not data:
                 break
-            buffer += data.decode("utf-8")
-            while "\n" in buffer:
-                raw, buffer = buffer.split("\n", 1)
-                if "|" in raw:
-                    tag, content = raw.split("|", 1)
+            buffer += data
+            while b"\n" in buffer:
+                raw, buffer = buffer.split(b"\n", 1)
+                text = raw.decode("utf-8", errors="replace")
+                if "|" in text:
+                    tag, content = text.split("|", 1)
                     process_message(client, address, tag, content.strip())
     except (ConnectionResetError, UnicodeDecodeError, OSError):
         pass
